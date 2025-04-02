@@ -1,7 +1,15 @@
 use io_uring::{opcode, types, IoUring};
 use std::fs::OpenOptions;
-use std::io::{self};
+use std::io;
 use std::os::unix::io::AsRawFd;
+
+const QUEUE_DEPTH: usize = 16;
+const BUFFER_SIZE: usize = 4096;
+
+struct IORequest {
+    buffer: Vec<u8>,
+    offset: u64,
+}
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -9,7 +17,8 @@ fn main() -> io::Result<()> {
         eprintln!("Usage: {} <input_file> <output_file>", args[0]);
         std::process::exit(1);
     }
-    let mut ring = IoUring::new(8)?;
+
+    let mut ring = IoUring::new((QUEUE_DEPTH * 2) as u32)?;
     let input_path = &args[1];
     let output_path = &args[2];
 
@@ -26,84 +35,101 @@ fn main() -> io::Result<()> {
     println!("Reading from: {}", input_path);
     println!("Writing to: {}", output_path);
 
-    let mut buffer = vec![0u8; 4096];
-    let mut total_bytes_read = 0;
+    let mut pending_reads = Vec::new();
+    let mut pending_writes = Vec::new();
     let mut total_bytes_written = 0;
-    let mut read_offset: u64 = 0;
 
-    loop {
+    for i in 0..QUEUE_DEPTH {
+        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let offset = (i * BUFFER_SIZE) as u64;
+
+        let read_e = opcode::Read::new(types::Fd(input_fd), buffer.as_mut_ptr(), BUFFER_SIZE as _)
+            .offset(offset)
+            .build()
+            .user_data(offset);
+
         unsafe {
-            let read_e =
-                opcode::Read::new(types::Fd(input_fd), buffer.as_mut_ptr(), buffer.len() as _)
-                    .offset(read_offset)
-                    .build()
-                    .user_data(0x1);
-
             ring.submission()
                 .push(&read_e)
-                .expect("Failed to push read request");
+                .expect("Failed to queue read request");
         }
 
+        pending_reads.push(IORequest { buffer, offset });
+    }
+
+    while !pending_reads.is_empty() || !pending_writes.is_empty() {
         ring.submit_and_wait(1)?;
-        let read_cqe = ring.completion().next().expect("Read CQE missing");
-        let bytes_read = read_cqe.result();
 
-        if bytes_read < 0 {
-            eprintln!("Read error: {}", io::Error::from_raw_os_error(-bytes_read));
-            break;
-        }
+        let completions: Vec<_> = ring.completion().collect();
+        for cqe in completions.iter() {
+            let result = cqe.result();
+            let user_data = cqe.user_data();
 
-        if bytes_read == 0 {
-            println!("Reached end of file.");
-            break;
-        }
+            if result < 0 {
+                eprintln!("I/O error: {}", io::Error::from_raw_os_error(-result));
+                continue;
+            }
 
-        total_bytes_read += bytes_read;
-        read_offset += bytes_read as u64;
-        println!("Read {} bytes", bytes_read);
+            if let Some(index) = pending_reads.iter().position(|r| r.offset == user_data) {
+                let read_request = pending_reads.remove(index);
+                if result == 0 {
+                    println!("Reached end of file.");
+                    continue;
+                }
 
-        let mut write_offset = 0;
-        let mut output_offset: u64 = total_bytes_written as u64;
+                let bytes_read = result as usize;
 
-        while write_offset < bytes_read {
-            let bytes_to_write = bytes_read - write_offset;
-
-            unsafe {
                 let write_e = opcode::Write::new(
                     types::Fd(output_fd),
-                    buffer[write_offset as usize..].as_ptr(),
-                    bytes_to_write as _,
+                    read_request.buffer.as_ptr(),
+                    bytes_read as _,
                 )
-                .offset(output_offset)
+                .offset(read_request.offset)
                 .build()
-                .user_data(0x2);
+                .user_data(read_request.offset + BUFFER_SIZE as u64);
 
-                ring.submission()
-                    .push(&write_e)
-                    .expect("Failed to push write request");
-            }
+                unsafe {
+                    ring.submission()
+                        .push(&write_e)
+                        .expect("Failed to queue write request");
+                }
 
-            ring.submit_and_wait(1)?;
-            let write_cqe = ring.completion().next().expect("Write CQE missing");
-            let bytes_written = write_cqe.result();
-
-            if bytes_written < 0 {
-                eprintln!(
-                    "Write error: {}",
-                    io::Error::from_raw_os_error(-bytes_written)
+                pending_writes.push(IORequest {
+                    buffer: read_request.buffer,
+                    offset: read_request.offset,
+                });
+                println!("Read {} bytes at offset {}", bytes_read, user_data);
+            } else if let Some(index) = pending_writes
+                .iter()
+                .position(|w| w.offset == user_data - BUFFER_SIZE as u64)
+            {
+                let write_request = pending_writes.remove(index);
+                total_bytes_written += result as usize;
+                println!(
+                    "Written {} bytes at offset {}",
+                    result, write_request.offset
                 );
-                break;
-            }
 
-            output_offset += bytes_written as u64;
-            total_bytes_written += bytes_written;
-            write_offset += bytes_written;
-            println!("Written {} bytes", bytes_written);
+                let offset = write_request.offset + (QUEUE_DEPTH as u64 * BUFFER_SIZE as u64);
+                let mut buffer = vec![0u8; BUFFER_SIZE];
+
+                let read_e =
+                    opcode::Read::new(types::Fd(input_fd), buffer.as_mut_ptr(), BUFFER_SIZE as _)
+                        .offset(offset)
+                        .build()
+                        .user_data(offset);
+
+                unsafe {
+                    ring.submission()
+                        .push(&read_e)
+                        .expect("Failed to queue next read request");
+                }
+
+                pending_reads.push(IORequest { buffer, offset });
+            }
         }
     }
 
-    println!("Total bytes read: {}", total_bytes_read);
     println!("Total bytes written: {}", total_bytes_written);
-
     Ok(())
 }
